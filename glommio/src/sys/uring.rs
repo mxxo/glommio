@@ -70,6 +70,7 @@ enum UringOpDescriptor {
     Close,
     FDataSync,
     Connect(*const SockAddr),
+    LinkTimeout(*const uring_sys::__kernel_timespec),
     Accept(*mut SockAddrStorage),
     Fallocate(u64, u64, libc::c_int),
     Statx(*const u8, *mut libc::statx),
@@ -249,6 +250,7 @@ static GLOMMIO_URING_OPS: &[IoRingOp] = &[
     IoRingOp::IORING_OP_TIMEOUT,
     IoRingOp::IORING_OP_TIMEOUT_REMOVE,
     IoRingOp::IORING_OP_ACCEPT,
+    IoRingOp::IORING_OP_LINK_TIMEOUT,
     IoRingOp::IORING_OP_CONNECT,
     IoRingOp::IORING_OP_FALLOCATE,
     IoRingOp::IORING_OP_OPENAT,
@@ -313,6 +315,10 @@ where
             }
             UringOpDescriptor::Connect(addr) => {
                 sqe.prep_connect(op.fd, &*addr);
+            }
+
+            UringOpDescriptor::LinkTimeout(timespec) => {
+                sqe.prep_link_timeout(&*timespec);
             }
 
             UringOpDescriptor::Accept(addr) => {
@@ -452,10 +458,8 @@ where
         let src = consume_source(from_user_data(value.user_data()));
 
         let result = value.result();
-        let was_cancelled =
-            matches!(&result, Err(err) if err.raw_os_error() == Some(libc::ECANCELED));
 
-        if !was_cancelled && try_process(&*src).is_none() {
+        if try_process(&*src).is_none() {
             let mut w = src.wakers.borrow_mut();
             w.result = Some(result.map(|x| x as usize));
             if let Some(waiter) = w.waiter.take() {
@@ -1213,7 +1217,7 @@ impl Reactor {
 
     pub(crate) fn connect(&self, source: &Source) {
         match &*source.source_type() {
-            SourceType::Connect(addr) => {
+            SourceType::Connect(addr) | SourceType::ConnectTimeout(addr, _) => {
                 let op = UringOpDescriptor::Connect(addr as *const SockAddr);
                 self.queue_standard_request(source, op);
             }
@@ -1479,13 +1483,27 @@ fn queue_request_into_ring(
     let q = ring.borrow_mut().submission_queue();
     let id = add_source(source, Rc::clone(&q));
 
+    let flags = match &*source.source_type() {
+        SourceType::ConnectTimeout(_, _) => SubmissionFlags::IO_LINK,
+        _ => SubmissionFlags::empty(),
+    };
+
     let mut queue = q.borrow_mut();
     queue.submissions.push_back(UringDescriptor {
         args: descriptor,
         fd: source.raw(),
-        flags: SubmissionFlags::empty(),
+        flags,
         user_data: to_user_data(id),
     });
+
+    if let SourceType::ConnectTimeout(_, ts) = &*source.source_type() {
+        queue.submissions.push_back(UringDescriptor {
+            args: UringOpDescriptor::LinkTimeout(&ts.raw as *const _),
+            flags: SubmissionFlags::empty(),
+            fd: -1,
+            user_data: 0,
+        });
+    }
 }
 
 impl Drop for Reactor {
